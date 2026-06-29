@@ -1,0 +1,228 @@
+# =============================================================================
+# Script: 02_deseq2_analysis.R
+# Purpose: Differential expression analysis using DESeq2
+# Method: Negative binomial GLM with Wald test
+# Reference: Love MI, Huber W, Anders S (2014). Genome Biology, 15:550.
+# Author: Abdullah Afzal Alvi
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(EnhancedVolcano)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(airway)
+  library(SummarizedExperiment)
+  library(tidyverse)
+})
+
+# =============================================================================
+# SECTION 1: Load Data and Build DESeqDataSet
+# =============================================================================
+data("airway")
+se <- airway
+count_matrix <- assay(se, "counts")
+col_data <- as.data.frame(colData(se))
+col_data$condition <- col_data$dex  # "trt" vs "untrt"
+
+# Pre-filter low-count genes
+keep <- rowSums(count_matrix) >= 10
+count_filtered <- count_matrix[keep, ]
+
+# Build DESeqDataSet object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_filtered,
+  colData   = col_data,
+  design    = ~ condition
+)
+
+# Set reference level (control group must be reference)
+dds$condition <- relevel(dds$condition, ref = "untrt")
+
+cat("DESeqDataSet created.\n")
+cat(sprintf("Genes: %d | Samples: %d\n", nrow(dds), ncol(dds)))
+
+# =============================================================================
+# SECTION 2: Run DESeq2
+# =============================================================================
+# DESeq() performs:
+#   1. Estimation of size factors (normalization)
+#   2. Estimation of gene-wise dispersions
+#   3. Fitting negative binomial GLM
+#   4. Wald test for significance
+
+cat("\nRunning DESeq2...\n")
+dds <- DESeq(dds)
+
+# =============================================================================
+# SECTION 3: Extract Results
+# =============================================================================
+# Default contrast: trt vs untrt
+res <- results(dds,
+               contrast      = c("condition", "trt", "untrt"),
+               alpha         = 0.05,          # FDR threshold for independent filtering
+               pAdjustMethod = "BH")          # Benjamini-Hochberg correction
+
+cat("\n=== DESeq2 Results Summary ===\n")
+summary(res)
+
+# Convert to data frame and sort by adjusted p-value
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Apply significance thresholds
+res_df <- res_df %>%
+  mutate(
+    significance = case_when(
+      padj < 0.05 & log2FoldChange >  1.5 ~ "UP",
+      padj < 0.05 & log2FoldChange < -1.5 ~ "DOWN",
+      TRUE                                 ~ "NS"
+    )
+  )
+
+cat(sprintf("\nTotal tested genes: %d\n", nrow(res_df)))
+cat(sprintf("Significant DEGs (FDR < 0.05, |LFC| > 1.5): %d\n",
+            sum(res_df$significance != "NS")))
+cat(sprintf("  Upregulated: %d\n",   sum(res_df$significance == "UP")))
+cat(sprintf("  Downregulated: %d\n", sum(res_df$significance == "DOWN")))
+
+# Save results
+write.csv(res_df, "results/tables/DESeq2_results.csv", row.names = FALSE)
+
+# Save significant DEGs only
+sig_df <- res_df %>% filter(significance != "NS")
+write.csv(sig_df, "results/tables/DESeq2_significant_DEGs.csv", row.names = FALSE)
+
+cat("\nResults saved.\n")
+
+# =============================================================================
+# SECTION 4: Normalized Count Matrix (VST)
+# =============================================================================
+# Variance Stabilizing Transformation for visualization purposes
+# VST is preferred over rlog for large datasets (>30 samples)
+vst_data <- vst(dds, blind = FALSE)
+
+# Save normalized counts
+vst_matrix <- assay(vst_data)
+write.csv(as.data.frame(vst_matrix), "results/tables/DESeq2_VST_normalized_counts.csv")
+
+# =============================================================================
+# SECTION 5: PCA on VST Data (Post-normalization)
+# =============================================================================
+pca_res <- plotPCA(vst_data, intgroup = "condition", returnData = TRUE)
+var_exp <- round(100 * attr(pca_res, "percentVar"), 1)
+
+p_pca_vst <- ggplot(pca_res, aes(x = PC1, y = PC2, color = condition, label = name)) +
+  geom_point(size = 5, alpha = 0.85) +
+  ggrepel::geom_text_repel(size = 3.5) +
+  scale_color_manual(values = c(untrt = "#2196F3", trt = "#F44336")) +
+  labs(
+    title = "PCA of VST-Normalized Counts (DESeq2)",
+    x     = paste0("PC1: ", var_exp[1], "% variance"),
+    y     = paste0("PC2: ", var_exp[2], "% variance"),
+    color = "Condition"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave("results/plots/deseq2_pca_vst.pdf", p_pca_vst, width = 7, height = 6)
+ggsave("results/plots/deseq2_pca_vst.png", p_pca_vst, width = 7, height = 6, dpi = 300)
+
+# =============================================================================
+# SECTION 6: MA Plot
+# =============================================================================
+pdf("results/plots/deseq2_ma_plot.pdf", width = 7, height = 5)
+plotMA(res,
+       alpha = 0.05,
+       main  = "MA Plot — DESeq2 (trt vs untrt)",
+       colSig = "#F44336",
+       colNonSig = "grey60",
+       ylim  = c(-5, 5))
+abline(h = c(-1.5, 1.5), lty = 2, col = "darkblue", lwd = 1.2)
+dev.off()
+
+# =============================================================================
+# SECTION 7: Volcano Plot
+# =============================================================================
+p_volcano <- EnhancedVolcano(
+  res_df,
+  lab            = res_df$gene_id,
+  x              = "log2FoldChange",
+  y              = "padj",
+  pCutoff        = 0.05,
+  FCcutoff       = 1.5,
+  title          = "DESeq2 Differential Expression",
+  subtitle       = "trt vs untrt | FDR < 0.05 | |LFC| > 1.5",
+  xlab           = expression(paste("Log"[2], " Fold Change")),
+  ylab           = expression(paste("-Log"[10], " Adjusted p-value")),
+  col            = c("grey60", "grey40", "#2196F3", "#F44336"),
+  colAlpha       = 0.75,
+  legendLabels   = c("NS", "LFC only", "FDR only", "FDR + LFC"),
+  legendPosition = "right",
+  pointSize      = 2.5,
+  labSize        = 3.0,
+  drawConnectors = TRUE,
+  max.overlaps   = 20
+)
+
+ggsave("results/plots/deseq2_volcano.pdf", p_volcano, width = 10, height = 8)
+ggsave("results/plots/deseq2_volcano.png", p_volcano, width = 10, height = 8, dpi = 300)
+
+# =============================================================================
+# SECTION 8: Heatmap of Top 50 DEGs
+# =============================================================================
+top50_genes <- sig_df %>%
+  arrange(padj) %>%
+  head(50) %>%
+  pull(gene_id)
+
+top50_vst <- vst_matrix[top50_genes, , drop = FALSE]
+
+# Z-score scaling per gene (row)
+top50_scaled <- t(scale(t(top50_vst)))
+
+annotation_col <- data.frame(
+  Condition = col_data$condition[match(colnames(top50_scaled), rownames(col_data))]
+)
+rownames(annotation_col) <- colnames(top50_scaled)
+
+ann_colors <- list(Condition = c(untrt = "#2196F3", trt = "#F44336"))
+
+pdf("results/plots/deseq2_heatmap_top50.pdf", width = 9, height = 14)
+pheatmap(
+  top50_scaled,
+  annotation_col    = annotation_col,
+  annotation_colors = ann_colors,
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 7,
+  fontsize_col      = 9,
+  main              = "Top 50 DEGs — Z-Scored VST Counts (DESeq2)"
+)
+dev.off()
+
+# =============================================================================
+# SECTION 9: Dispersion Plot
+# =============================================================================
+pdf("results/plots/deseq2_dispersion.pdf", width = 7, height = 5)
+plotDispEsts(dds,
+             main = "Gene-Wise Dispersion Estimates (DESeq2)",
+             cex  = 0.5)
+dev.off()
+
+# =============================================================================
+# SECTION 10: Save Session Info for Reproducibility
+# =============================================================================
+sink("results/tables/DESeq2_session_info.txt")
+cat("=== DESeq2 Analysis Session Info ===\n\n")
+cat(sprintf("Date: %s\n\n", Sys.time()))
+sessionInfo()
+sink()
+
+cat("\n=== DESeq2 Analysis Complete ===\n")
+cat("All outputs saved to results/\n")

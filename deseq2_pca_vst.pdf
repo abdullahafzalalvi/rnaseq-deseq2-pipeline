@@ -1,0 +1,143 @@
+# =============================================================================
+# Script: 04_cross_tool_comparison.R
+# Purpose: Compare DESeq2 and edgeR results to identify consensus DEGs
+# Rationale: Genes significant in BOTH tools have higher confidence.
+#            This is a publishable validation strategy.
+# Author: Abdullah Afzal Alvi
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggVennDiagram)
+  library(tidyverse)
+  library(RColorBrewer)
+})
+
+# =============================================================================
+# SECTION 1: Load Results from Both Tools
+# =============================================================================
+deseq2_res <- read.csv("results/tables/DESeq2_results.csv")
+edger_res  <- read.csv("results/tables/edgeR_results.csv")
+
+# Significant DEG sets
+deseq2_sig <- deseq2_res %>% filter(significance != "NS") %>% pull(gene_id)
+edger_sig  <- edger_res  %>% filter(significance != "NS") %>% pull(gene_id)
+
+cat("=== Cross-Tool DEG Count Summary ===\n")
+cat(sprintf("DESeq2 significant DEGs: %d\n",  length(deseq2_sig)))
+cat(sprintf("edgeR significant DEGs:  %d\n",  length(edger_sig)))
+cat(sprintf("Consensus (overlap):     %d\n",  length(intersect(deseq2_sig, edger_sig))))
+cat(sprintf("DESeq2 unique:           %d\n",  length(setdiff(deseq2_sig, edger_sig))))
+cat(sprintf("edgeR unique:            %d\n",  length(setdiff(edger_sig, deseq2_sig))))
+
+# =============================================================================
+# SECTION 2: Venn Diagram of DEG Overlap
+# =============================================================================
+deg_list <- list(DESeq2 = deseq2_sig, edgeR = edger_sig)
+
+p_venn <- ggVennDiagram(
+  deg_list,
+  label_alpha = 0,
+  set_color   = c("#1565C0", "#C62828")
+) +
+  scale_fill_gradient(low = "#FFFFFF", high = "#EF9A9A") +
+  labs(title = "DEG Overlap: DESeq2 vs edgeR",
+       subtitle = "FDR < 0.05 | |LFC| > 1.5") +
+  theme(legend.title = element_blank())
+
+ggsave("results/plots/venn_deseq2_edger_overlap.pdf", p_venn, width = 7, height = 6)
+ggsave("results/plots/venn_deseq2_edger_overlap.png", p_venn, width = 7, height = 6, dpi = 300)
+
+# =============================================================================
+# SECTION 3: LFC Correlation Scatter Plot
+# =============================================================================
+# Merge on gene_id — only genes present in both result tables
+merged <- inner_join(
+  deseq2_res %>% select(gene_id, log2FoldChange, padj) %>% rename(LFC_DESeq2 = log2FoldChange, padj_DESeq2 = padj),
+  edger_res  %>% select(gene_id, log2FoldChange, padj) %>% rename(LFC_edgeR  = log2FoldChange, padj_edgeR  = padj),
+  by = "gene_id"
+)
+
+merged <- merged %>%
+  mutate(
+    category = case_when(
+      gene_id %in% intersect(deseq2_sig, edger_sig) ~ "Consensus DEG",
+      gene_id %in% setdiff(deseq2_sig, edger_sig)   ~ "DESeq2 only",
+      gene_id %in% setdiff(edger_sig, deseq2_sig)   ~ "edgeR only",
+      TRUE                                            ~ "Non-significant"
+    )
+  )
+
+# Calculate Pearson correlation
+lfc_cor <- cor(merged$LFC_DESeq2, merged$LFC_edgeR, use = "complete.obs", method = "pearson")
+
+p_scatter <- ggplot(merged, aes(x = LFC_DESeq2, y = LFC_edgeR, color = category)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "Consensus DEG"   = "#F44336",
+    "DESeq2 only"     = "#2196F3",
+    "edgeR only"      = "#4CAF50",
+    "Non-significant" = "grey80"
+  )) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.2, vjust = 1.5,
+           label = sprintf("Pearson r = %.4f", lfc_cor), size = 4.5) +
+  labs(
+    title    = "LFC Correlation: DESeq2 vs edgeR",
+    subtitle = "Each point represents one gene",
+    x        = expression(paste("Log"[2], " Fold Change (DESeq2)")),
+    y        = expression(paste("Log"[2], " Fold Change (edgeR)")),
+    color    = "Category"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave("results/plots/lfc_correlation_scatter.pdf", p_scatter, width = 8, height = 7)
+ggsave("results/plots/lfc_correlation_scatter.png", p_scatter, width = 8, height = 7, dpi = 300)
+
+cat(sprintf("\nPearson r (LFC correlation, DESeq2 vs edgeR): %.4f\n", lfc_cor))
+
+# =============================================================================
+# SECTION 4: Save Consensus DEG Table
+# =============================================================================
+consensus_genes <- intersect(deseq2_sig, edger_sig)
+
+consensus_df <- merged %>%
+  filter(gene_id %in% consensus_genes) %>%
+  select(gene_id, LFC_DESeq2, padj_DESeq2, LFC_edgeR, padj_edgeR) %>%
+  mutate(
+    mean_LFC       = (LFC_DESeq2 + LFC_edgeR) / 2,
+    direction      = ifelse(mean_LFC > 0, "UP", "DOWN")
+  ) %>%
+  arrange(padj_DESeq2)
+
+write.csv(consensus_df, "results/tables/consensus_DEGs.csv", row.names = FALSE)
+
+cat(sprintf("\nConsensus DEG table saved: %d genes\n", nrow(consensus_df)))
+cat(sprintf("  Upregulated in consensus:   %d\n", sum(consensus_df$direction == "UP")))
+cat(sprintf("  Downregulated in consensus: %d\n", sum(consensus_df$direction == "DOWN")))
+
+# =============================================================================
+# SECTION 5: Comparison Table for Manuscript
+# =============================================================================
+comparison_table <- data.frame(
+  Metric               = c("Total genes tested", "Significant DEGs", 
+                            "Upregulated", "Downregulated", 
+                            "Unique to tool", "Shared with other tool"),
+  DESeq2               = c(nrow(deseq2_res), length(deseq2_sig),
+                            sum(deseq2_res$significance == "UP", na.rm = TRUE),
+                            sum(deseq2_res$significance == "DOWN", na.rm = TRUE),
+                            length(setdiff(deseq2_sig, edger_sig)),
+                            length(intersect(deseq2_sig, edger_sig))),
+  edgeR                = c(nrow(edger_res), length(edger_sig),
+                            sum(edger_res$significance == "UP", na.rm = TRUE),
+                            sum(edger_res$significance == "DOWN", na.rm = TRUE),
+                            length(setdiff(edger_sig, deseq2_sig)),
+                            length(intersect(deseq2_sig, edger_sig)))
+)
+
+write.csv(comparison_table, "results/tables/tool_comparison_summary.csv", row.names = FALSE)
+
+cat("\n=== Tool Comparison Table ===\n")
+print(comparison_table)
+cat("\nComparison table saved to results/tables/tool_comparison_summary.csv\n")
+cat("\n=== Cross-Tool Comparison Complete ===\n")

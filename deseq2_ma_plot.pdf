@@ -1,0 +1,209 @@
+# =============================================================================
+# Script: 03_edger_analysis.R
+# Purpose: Parallel differential expression analysis using edgeR
+# Method: TMM normalization + quasi-likelihood F-test (QLF)
+# Reference: Robinson MD, McCarthy DJ, Smyth GK (2010). Bioinformatics, 26(1):139-140.
+# Author: Abdullah Afzal Alvi
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(EnhancedVolcano)
+  library(airway)
+  library(SummarizedExperiment)
+  library(tidyverse)
+})
+
+# =============================================================================
+# SECTION 1: Load Data
+# =============================================================================
+data("airway")
+se <- airway
+count_matrix <- assay(se, "counts")
+col_data <- as.data.frame(colData(se))
+col_data$condition <- col_data$dex
+
+# Same pre-filter as DESeq2 for fair comparison
+keep <- rowSums(count_matrix) >= 10
+count_filtered <- count_matrix[keep, ]
+
+# =============================================================================
+# SECTION 2: Build DGEList and Normalize
+# =============================================================================
+group <- factor(col_data$condition[match(colnames(count_filtered), rownames(col_data))])
+group <- relevel(group, ref = "untrt")
+
+dge <- DGEList(counts = count_filtered, group = group)
+
+# TMM normalization (Trimmed Mean of M-values)
+# This corrects for differences in RNA composition between samples
+dge <- calcNormFactors(dge, method = "TMM")
+
+cat("=== edgeR DGEList Created ===\n")
+cat(sprintf("Genes: %d | Samples: %d\n", nrow(dge), ncol(dge)))
+cat("\nNormalization factors:\n")
+print(dge$samples)
+
+# =============================================================================
+# SECTION 3: Design Matrix and Dispersion Estimation
+# =============================================================================
+design <- model.matrix(~ group)
+colnames(design) <- c("Intercept", "trt_vs_untrt")
+
+# Estimate dispersions (three steps):
+#   1. Common dispersion
+#   2. Trended dispersion
+#   3. Tagwise (gene-wise) dispersion
+dge <- estimateDisp(dge, design, robust = TRUE)
+
+cat(sprintf("\nCommon BCV (Biological Coefficient of Variation): %.4f\n",
+            sqrt(dge$common.dispersion)))
+
+# Save BCV plot
+pdf("results/plots/edger_bcv_plot.pdf", width = 7, height = 5)
+plotBCV(dge, main = "Biological Coefficient of Variation (edgeR)")
+dev.off()
+
+# =============================================================================
+# SECTION 4: Quasi-Likelihood Fitting and QLF Test
+# =============================================================================
+# QLF test is preferred over exact test for complex designs and
+# provides better control of Type I error rate
+
+fit <- glmQLFit(dge, design, robust = TRUE)
+
+# Save QLDisp plot
+pdf("results/plots/edger_qldisp_plot.pdf", width = 7, height = 5)
+plotQLDisp(fit, main = "Quasi-Likelihood Dispersions (edgeR)")
+dev.off()
+
+# Test the contrast: trt vs untrt
+qlf <- glmQLFTest(fit, coef = "trt_vs_untrt")
+
+cat("\n=== edgeR QLF Test Summary ===\n")
+summary(decideTests(qlf, p.value = 0.05, lfc = 1.5))
+
+# =============================================================================
+# SECTION 5: Extract and Format Results
+# =============================================================================
+res_edger <- topTags(qlf, n = Inf, adjust.method = "BH", sort.by = "PValue")
+res_df_edger <- as.data.frame(res_edger$table) %>%
+  rownames_to_column("gene_id") %>%
+  rename(
+    log2FoldChange = logFC,
+    pvalue         = PValue,
+    padj           = FDR
+  ) %>%
+  filter(!is.na(padj))
+
+# Significance classification
+res_df_edger <- res_df_edger %>%
+  mutate(
+    significance = case_when(
+      padj < 0.05 & log2FoldChange >  1.5 ~ "UP",
+      padj < 0.05 & log2FoldChange < -1.5 ~ "DOWN",
+      TRUE                                 ~ "NS"
+    )
+  )
+
+cat(sprintf("\nTotal tested genes: %d\n", nrow(res_df_edger)))
+cat(sprintf("Significant DEGs (FDR < 0.05, |LFC| > 1.5): %d\n",
+            sum(res_df_edger$significance != "NS")))
+cat(sprintf("  Upregulated: %d\n",   sum(res_df_edger$significance == "UP")))
+cat(sprintf("  Downregulated: %d\n", sum(res_df_edger$significance == "DOWN")))
+
+write.csv(res_df_edger, "results/tables/edgeR_results.csv", row.names = FALSE)
+
+sig_edger <- res_df_edger %>% filter(significance != "NS")
+write.csv(sig_edger, "results/tables/edgeR_significant_DEGs.csv", row.names = FALSE)
+
+# =============================================================================
+# SECTION 6: Volcano Plot
+# =============================================================================
+p_volcano_edger <- EnhancedVolcano(
+  res_df_edger,
+  lab            = res_df_edger$gene_id,
+  x              = "log2FoldChange",
+  y              = "padj",
+  pCutoff        = 0.05,
+  FCcutoff       = 1.5,
+  title          = "edgeR Differential Expression",
+  subtitle       = "trt vs untrt | FDR < 0.05 | |LFC| > 1.5",
+  xlab           = expression(paste("Log"[2], " Fold Change")),
+  ylab           = expression(paste("-Log"[10], " Adjusted p-value")),
+  col            = c("grey60", "grey40", "#4CAF50", "#FF9800"),
+  colAlpha       = 0.75,
+  legendPosition = "right",
+  pointSize      = 2.5,
+  labSize        = 3.0,
+  drawConnectors = TRUE,
+  max.overlaps   = 20
+)
+
+ggsave("results/plots/edger_volcano.pdf", p_volcano_edger, width = 10, height = 8)
+ggsave("results/plots/edger_volcano.png", p_volcano_edger, width = 10, height = 8, dpi = 300)
+
+# =============================================================================
+# SECTION 7: MD Plot (equivalent to MA plot in edgeR)
+# =============================================================================
+pdf("results/plots/edger_md_plot.pdf", width = 7, height = 5)
+plotMD(qlf,
+       main   = "MD Plot — edgeR (trt vs untrt)",
+       status = decideTests(qlf, p.value = 0.05, lfc = 1.5),
+       values = c(-1, 0, 1),
+       col    = c("#2196F3", "grey70", "#F44336"),
+       cex    = 0.5)
+abline(h = c(-1.5, 1.5), lty = 2, col = "darkgreen", lwd = 1.2)
+dev.off()
+
+# =============================================================================
+# SECTION 8: Heatmap of Top 50 edgeR DEGs
+# =============================================================================
+# Get TMM-normalized log-CPM values
+logcpm <- cpm(dge, log = TRUE, normalized.lib.sizes = TRUE)
+
+top50_edger <- sig_edger %>%
+  arrange(padj) %>%
+  head(50) %>%
+  pull(gene_id)
+
+top50_logcpm <- logcpm[top50_edger, , drop = FALSE]
+top50_scaled_edger <- t(scale(t(top50_logcpm)))
+
+annotation_col <- data.frame(
+  Condition = as.character(group[match(colnames(top50_scaled_edger),
+                                       rownames(col_data))])
+)
+rownames(annotation_col) <- colnames(top50_scaled_edger)
+
+ann_colors <- list(Condition = c(untrt = "#2196F3", trt = "#F44336"))
+
+pdf("results/plots/edger_heatmap_top50.pdf", width = 9, height = 14)
+pheatmap(
+  top50_scaled_edger,
+  annotation_col    = annotation_col,
+  annotation_colors = ann_colors,
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  show_rownames     = TRUE,
+  fontsize_row      = 7,
+  fontsize_col      = 9,
+  main              = "Top 50 DEGs — Z-Scored logCPM (edgeR)"
+)
+dev.off()
+
+# =============================================================================
+# SECTION 9: Session Info
+# =============================================================================
+sink("results/tables/edgeR_session_info.txt")
+cat("=== edgeR Analysis Session Info ===\n\n")
+cat(sprintf("Date: %s\n\n", Sys.time()))
+sessionInfo()
+sink()
+
+cat("\n=== edgeR Analysis Complete ===\n")
+cat("All outputs saved to results/\n")

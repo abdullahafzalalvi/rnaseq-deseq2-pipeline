@@ -1,0 +1,186 @@
+# =============================================================================
+# Script: 01_data_qc.R
+# Purpose: Quality control of raw count matrix before differential expression
+# Checks: library sizes, gene detection rates, sample correlation, PCA
+# Author: Abdullah Afzal Alvi
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(airway)
+  library(SummarizedExperiment)
+  library(tidyverse)
+})
+
+# Create output directories if they don't exist
+dir.create("results/plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+
+# =============================================================================
+# SECTION 1: Load Data
+# =============================================================================
+data("airway")
+se <- airway
+count_matrix <- assay(se, "counts")
+col_data <- as.data.frame(colData(se))
+col_data$condition <- col_data$dex   # "trt" vs "untrt"
+
+# --- Option B: Load your own data ---
+# count_matrix <- read.csv("data/raw/counts.csv", row.names = 1)
+# col_data     <- read.csv("data/metadata/coldata.csv", row.names = 1)
+
+cat("=== Data Loaded ===\n")
+cat(sprintf("Genes: %d\n", nrow(count_matrix)))
+cat(sprintf("Samples: %d\n", ncol(count_matrix)))
+cat(sprintf("Conditions: %s\n", paste(unique(col_data$condition), collapse = ", ")))
+
+# Guard: sample names in count matrix must match metadata rownames exactly
+stopifnot(
+  "Sample names in count matrix do not match metadata rownames. Check your input files." =
+    all(colnames(count_matrix) %in% rownames(col_data))
+)
+
+# =============================================================================
+# SECTION 2: Pre-filtering
+# =============================================================================
+keep <- rowSums(count_matrix) >= 10
+count_filtered <- count_matrix[keep, ]
+
+cat(sprintf("\nGenes before filtering: %d\n", nrow(count_matrix)))
+cat(sprintf("Genes after filtering (>=10 total reads): %d\n", nrow(count_filtered)))
+cat(sprintf("Genes removed: %d\n", nrow(count_matrix) - nrow(count_filtered)))
+
+# =============================================================================
+# SECTION 3: Library Size Check
+# =============================================================================
+lib_sizes <- colSums(count_filtered)
+lib_df <- data.frame(
+  sample    = names(lib_sizes),
+  lib_size  = lib_sizes,
+  condition = col_data$condition[match(names(lib_sizes), rownames(col_data))]
+)
+
+# REMOVED: .libPaths()       <-- debug line, served no purpose in script
+# REMOVED: library(ggplot2)  <-- duplicate load; caused "cannot unload" error
+
+p_libsize <- ggplot(lib_df, aes(x = reorder(sample, lib_size), y = lib_size / 1e6, fill = condition)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  coord_flip() +
+  scale_fill_manual(values = c(untrt = "#2196F3", trt = "#F44336")) +
+  labs(
+    title = "Library Sizes per Sample",
+    x     = "Sample",
+    y     = "Total Mapped Reads (millions)",
+    fill  = "Condition"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "right")
+
+ggsave("results/plots/qc_library_sizes.pdf", p_libsize, width = 8, height = 5)
+ggsave("results/plots/qc_library_sizes.png", p_libsize, width = 8, height = 5, dpi = 300)
+cat("\nLibrary size plot saved.\n")
+
+low_samples <- lib_df$sample[lib_df$lib_size < 1e6]
+if (length(low_samples) > 0) {
+  warning(sprintf("Low library size detected in: %s", paste(low_samples, collapse = ", ")))
+}
+
+# =============================================================================
+# SECTION 4: Gene Detection Rate
+# =============================================================================
+detection_df <- data.frame(
+  sample         = colnames(count_filtered),
+  genes_detected = colSums(count_filtered > 0),
+  condition      = col_data$condition[match(colnames(count_filtered), rownames(col_data))]
+)
+
+p_detection <- ggplot(detection_df, aes(x = reorder(sample, genes_detected), y = genes_detected, fill = condition)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+  coord_flip() +
+  scale_fill_manual(values = c(untrt = "#2196F3", trt = "#F44336")) +
+  labs(
+    title = "Gene Detection Rate per Sample",
+    x     = "Sample",
+    y     = "Number of Detected Genes (count > 0)",
+    fill  = "Condition"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave("results/plots/qc_gene_detection.pdf", p_detection, width = 8, height = 5)
+ggsave("results/plots/qc_gene_detection.png", p_detection, width = 8, height = 5, dpi = 300)
+
+# =============================================================================
+# SECTION 5: Sample-to-Sample Correlation Heatmap
+# =============================================================================
+log_counts <- log2(count_filtered + 1)
+sample_cor <- cor(log_counts, method = "pearson")
+
+annotation_col <- data.frame(
+  Condition = as.character(col_data$condition[match(colnames(count_filtered), rownames(col_data))])
+)
+rownames(annotation_col) <- colnames(count_filtered)
+
+ann_colors <- list(Condition = c(untrt = "#2196F3", trt = "#F44336"))
+
+pdf("results/plots/qc_sample_correlation_heatmap.pdf", width = 8, height = 7)
+pheatmap(
+  sample_cor,
+  annotation_col    = annotation_col,
+  annotation_colors = ann_colors,
+  color             = colorRampPalette(rev(brewer.pal(9, "RdYlBu")))(100),
+  main              = "Sample-to-Sample Pearson Correlation",
+  fontsize          = 10,
+  display_numbers   = TRUE,
+  number_format     = "%.3f"
+)
+dev.off()
+cat("Sample correlation heatmap saved.\n")
+
+# =============================================================================
+# SECTION 6: PCA on Raw Log-Counts
+# =============================================================================
+pca_res <- prcomp(t(log_counts), scale. = TRUE)
+pca_df  <- as.data.frame(pca_res$x[, 1:2])
+pca_df$sample    <- rownames(pca_df)
+pca_df$condition <- col_data$condition[match(pca_df$sample, rownames(col_data))]
+
+var_explained <- unname(round(summary(pca_res)$importance[2, 1:2] * 100, 1))
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = condition, label = sample)) +
+  geom_point(size = 5, alpha = 0.85) +
+  ggrepel::geom_text_repel(size = 3.5, max.overlaps = 20) +
+  scale_color_manual(values = c(untrt = "#2196F3", trt = "#F44336")) +
+  labs(
+    title = "PCA of Raw Log2-Transformed Counts",
+    x     = paste0("PC1 (", var_explained[1], "% variance)"),
+    y     = paste0("PC2 (", var_explained[2], "% variance)"),
+    color = "Condition"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "right")
+
+ggsave("results/plots/qc_pca_raw.pdf", p_pca, width = 7, height = 6)
+ggsave("results/plots/qc_pca_raw.png", p_pca, width = 7, height = 6, dpi = 300)
+
+# =============================================================================
+# SECTION 7: Save Filtered Count Matrix and QC Summary
+# =============================================================================
+write.csv(count_filtered, "data/raw/counts_filtered.csv")
+
+qc_summary <- data.frame(
+  Metric = c("Total genes (raw)", "Genes after filtering", "Genes removed",
+             "Number of samples", "Min library size", "Max library size"),
+  Value  = c(nrow(count_matrix), nrow(count_filtered),
+             nrow(count_matrix) - nrow(count_filtered),
+             ncol(count_filtered), min(lib_sizes), max(lib_sizes))
+)
+write.csv(qc_summary, "results/tables/qc_summary.csv", row.names = FALSE)
+
+cat("\n=== QC Complete ===\n")
+cat("Filtered count matrix saved to: data/raw/counts_filtered.csv\n")
+cat("QC summary saved to: results/tables/qc_summary.csv\n")
+cat("All QC plots saved to: results/plots/\n")
