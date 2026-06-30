@@ -293,6 +293,3 @@ If you use this pipeline, please cite the underlying methods:
 
 ---
 
-## License
-
-No license file is currently included. Add a `LICENSE` file (MIT is the common, permissive choice for academic pipelines like this one) if you want others to be able to reuse or build on this code with clear terms.
